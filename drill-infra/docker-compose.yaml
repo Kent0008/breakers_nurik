@@ -1,0 +1,139 @@
+services:
+  # MQTT Broker
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: drill-mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-logs:/mosquitto/log
+    command: mosquitto -c /mosquitto/config/mosquitto.conf
+    networks:
+      - drill-network
+
+  # PostgreSQL Database for drill-edge
+  postgres:
+    image: postgres:17
+    build:
+      context: ../drill-edge
+      dockerfile: Dockerfile.postgres
+    container_name: drill-edge-postgres
+    environment:
+      POSTGRES_DB: plc_data
+      POSTGRES_USER: ${DB_USER:-drill_user}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-drill_password}
+    ports:
+      - "5555:5432"
+    volumes:
+      - drill-edge-postgres-data:/var/lib/postgresql/data
+    networks:
+      - drill-network
+
+  # PostgreSQL Database for backend
+  backend-postgres:
+    image: postgres:15
+    container_name: drill-backend-postgres
+    environment:
+      POSTGRES_DB: drill_monitoring
+      POSTGRES_USER: drill_user
+      POSTGRES_PASSWORD: drill_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - backend-postgres-data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql
+    networks:
+      - drill-network
+
+  # Node-RED (точная копия drill-edge)
+  node-red:
+    image: nodered/node-red:latest
+    build:
+      context: ../drill-edge
+      dockerfile: Dockerfile.node-red
+    container_name: drill-edge-node-red
+    ports:
+      - "1880:1880"
+    volumes:
+      - drill-edge-node-red-data:/data
+      - ../drill-edge/init:/data/init
+    environment:
+      - MQTT_BROKER=mosquitto
+      - MQTT_PORT=1883
+    networks:
+      - drill-network
+    depends_on:
+      - postgres
+
+  # Redis для WebSocket
+  redis:
+    image: redis:7-alpine
+    container_name: drill-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - drill-network
+
+  # Django Backend
+  backend:
+    build:
+      context: ../drill-cloud/backend
+      dockerfile: Dockerfile
+    container_name: drill-backend
+    environment:
+      - POSTGRES_DB=drill_monitoring
+      - POSTGRES_USER=drill_user
+      - POSTGRES_PASSWORD=drill_password
+      - POSTGRES_HOST=backend-postgres
+      - POSTGRES_PORT=5432
+      - MQTT_BROKER=mosquitto
+      - MQTT_PORT=1883
+      - MQTT_CLIENT_ID=drill-backend
+      - DEBUG=True
+      - SECRET_KEY=django-insecure-drill-monitoring-key
+      - DJANGO_SETTINGS_MODULE=drill_monitoring.settings
+    ports:
+      - "8000:8000"
+    depends_on:
+      - backend-postgres
+      - mosquitto
+      - redis
+    volumes:
+      - ../drill-cloud/backend:/app
+    networks:
+      - drill-network
+    command: >
+      sh -c "python manage.py migrate &&
+             python manage.py start_mqtt &
+             daphne -b 0.0.0.0 -p 8000 drill_monitoring.asgi:application"
+
+  # React Frontend
+  frontend:
+    build:
+      context: ../drill-cloud/frontend
+      dockerfile: Dockerfile
+    container_name: drill-frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    volumes:
+      - ../drill-cloud/frontend:/app
+      - /app/node_modules
+    networks:
+      - drill-network
+
+volumes:
+  mosquitto-config:
+  mosquitto-data:
+  mosquitto-logs:
+  drill-edge-postgres-data:
+  drill-edge-node-red-data:
+  backend-postgres-data:
+
+networks:
+  drill-network:
+    driver: bridge 
