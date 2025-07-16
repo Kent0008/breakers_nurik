@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useCallback } from 'react'
 import {
   Grid,
   Paper,
@@ -16,45 +16,66 @@ import axios from 'axios'
 import useWebSocket from '../hooks/useWebSocket'
 
 function Dashboard() {
-  const [selectedTags, setSelectedTags] = useState(['pressure_1'])
+  const [selectedTags, setSelectedTags] = useState([])
   const [availableTags, setAvailableTags] = useState([])
   const [sensorData, setSensorData] = useState({})
   const [thresholds, setThresholds] = useState({})
   const [incidents, setIncidents] = useState([])
   const [loading, setLoading] = useState(true)
+  const [loadingTags, setLoadingTags] = useState(true)
   const [error, setError] = useState(null)
 
-  const { messages, sendMessage } = useWebSocket('ws://localhost:8000/ws/monitoring/')
+  const { messages, sendMessage, isConnected } = useWebSocket('/ws/monitoring/')
 
   // Загрузка доступных тегов
   useEffect(() => {
     const fetchTags = async () => {
+      setLoadingTags(true)
       try {
-        const response = await axios.get('/api/data/tags/')
-        setAvailableTags(response.data.tags)
+        const response = await axios.get('/api/data/tags/', {
+          timeout: 5000 // Таймаут 5 секунд
+        })
+        const tags = response.data.tags
+        setAvailableTags(tags)
+        
+        // Автоматически выбираем первые 2 тега для производительности
+        if (tags.length > 0 && selectedTags.length === 0) {
+          setSelectedTags(tags.slice(0, 2))
+        }
       } catch (err) {
         console.error('Ошибка загрузки тегов:', err)
+        // Если не удалось загрузить теги, используем пустой массив
+        setAvailableTags([])
+      } finally {
+        setLoadingTags(false)
       }
     }
     fetchTags()
-  }, [])
+  }, [selectedTags.length])
 
-  // Загрузка данных сенсоров
+  // Загрузка данных сенсоров с дебаунсингом
   useEffect(() => {
-    const fetchData = async () => {
+    const timeoutId = setTimeout(async () => {
+      if (selectedTags.length === 0) return
+      
       setLoading(true)
       try {
         const promises = selectedTags.map(tag =>
-          axios.get(`/api/data/?tag=${tag}&range=1h`)
+          axios.get(`/api/data/?tag=${tag}`)
         )
         const responses = await Promise.all(promises)
         
         const newData = {}
         responses.forEach((response, index) => {
-          newData[selectedTags[index]] = response.data.results.map(item => ({
+          const rawData = response.data.results.map(item => ({
             timestamp: new Date(item.timestamp).toLocaleTimeString(),
             value: parseFloat(item.value)
           }))
+          
+          // Ограничиваем количество точек для производительности
+          const maxPoints = 100
+          const step = Math.max(1, Math.floor(rawData.length / maxPoints))
+          newData[selectedTags[index]] = rawData.filter((_, index) => index % step === 0)
         })
         setSensorData(newData)
       } catch (err) {
@@ -63,11 +84,9 @@ function Dashboard() {
       } finally {
         setLoading(false)
       }
-    }
+    }, 300) // Дебаунсинг 300мс
 
-    if (selectedTags.length > 0) {
-      fetchData()
-    }
+    return () => clearTimeout(timeoutId)
   }, [selectedTags])
 
   // Загрузка уставок
@@ -90,31 +109,55 @@ function Dashboard() {
     fetchThresholds()
   }, [])
 
-  // Обработка WebSocket сообщений
+  // Подписка на WebSocket обновления для выбранных тегов
+  useEffect(() => {
+    if (isConnected && selectedTags.length > 0) {
+      selectedTags.forEach(tag => {
+        sendMessage({
+          type: 'subscribe_sensor',
+          tag: tag
+        })
+      })
+    }
+  }, [isConnected, selectedTags, sendMessage])
+
+  // Обработка WebSocket сообщений с ограничением
   useEffect(() => {
     messages.forEach(message => {
-      const data = JSON.parse(message)
-      
-      if (data.type === 'sensor_update') {
-        setSensorData(prev => ({
-          ...prev,
-          [data.tag]: [...(prev[data.tag] || []), {
-            timestamp: new Date(data.data.timestamp).toLocaleTimeString(),
-            value: data.data.value
-          }].slice(-50) // Ограничиваем количество точек
-        }))
-      } else if (data.type === 'incident_alert') {
-        setIncidents(prev => [data.incident, ...prev.slice(0, 9)])
+      try {
+        const data = JSON.parse(message)
+        console.log('WebSocket сообщение:', data)
+        
+        if (data.type === 'connection_established') {
+          console.log('WebSocket подключен:', data.message)
+        } else if (data.type === 'sensor_update') {
+          setSensorData(prev => ({
+            ...prev,
+            [data.tag]: [...(prev[data.tag] || []), {
+              timestamp: new Date(data.data.timestamp).toLocaleTimeString(),
+              value: data.data.value
+            }].slice(-20) // Ограничиваем до 20 последних точек
+          }))
+        } else if (data.type === 'incident_alert') {
+          setIncidents(prev => [data.incident, ...prev.slice(0, 5)]) // Ограничиваем до 5 инцидентов
+        }
+      } catch (err) {
+        console.error('Ошибка обработки WebSocket сообщения:', err)
       }
     })
   }, [messages])
 
   const handleTagChange = (event) => {
     const value = event.target.value
-    setSelectedTags(typeof value === 'string' ? value.split(',') : value)
+    const newTags = typeof value === 'string' ? value.split(',') : value
+    
+    // Ограничиваем до 3 тегов для производительности
+    if (newTags.length <= 3) {
+      setSelectedTags(newTags)
+    }
   }
 
-  const renderChart = (tag) => {
+  const renderChart = useCallback((tag) => {
     const data = sensorData[tag] || []
     const threshold = thresholds[tag]
 
@@ -153,13 +196,20 @@ function Dashboard() {
         </LineChart>
       </ResponsiveContainer>
     )
-  }
+  }, [sensorData, thresholds])
 
   return (
     <Box>
-      <Typography variant="h4" gutterBottom>
-        Мониторинг параметров
-      </Typography>
+      <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+        <Typography variant="h4">
+          Мониторинг параметров
+        </Typography>
+        <Chip
+          label={isConnected ? 'WebSocket подключен' : 'WebSocket отключен'}
+          color={isConnected ? 'success' : 'error'}
+          size="small"
+        />
+      </Box>
 
       {error && (
         <Alert severity="error" sx={{ mb: 2 }}>
@@ -170,20 +220,31 @@ function Dashboard() {
       <Grid container spacing={3} sx={{ mb: 3 }}>
         <Grid item xs={12} md={6}>
           <FormControl fullWidth>
-            <InputLabel>Выберите параметры</InputLabel>
+            <InputLabel>Выберите параметры (макс. 3)</InputLabel>
             <Select
               multiple
               value={selectedTags}
               onChange={handleTagChange}
-              label="Выберите параметры"
+              label="Выберите параметры (макс. 3)"
+              inputProps={{ maxLength: 3 }}
+              disabled={loadingTags}
             >
-              {availableTags.map((tag) => (
-                <MenuItem key={tag} value={tag}>
-                  {tag}
-                </MenuItem>
-              ))}
+              {loadingTags ? (
+                <MenuItem disabled>Загрузка тегов...</MenuItem>
+              ) : (
+                availableTags.map((tag) => (
+                  <MenuItem key={tag} value={tag}>
+                    {tag}
+                  </MenuItem>
+                ))
+              )}
             </Select>
           </FormControl>
+        </Grid>
+        <Grid item xs={12} md={6}>
+          <Typography variant="body2" color="textSecondary" sx={{ mt: 2 }}>
+            Выбрано: {selectedTags.length}/3 тегов. Для лучшей производительности рекомендуется выбирать не более 3 тегов одновременно.
+          </Typography>
         </Grid>
       </Grid>
 
@@ -193,6 +254,9 @@ function Dashboard() {
             <Paper sx={{ p: 2, height: 400 }}>
               <Typography variant="h6" gutterBottom>
                 {tag}
+                <Typography variant="caption" display="block" color="textSecondary">
+                  {sensorData[tag]?.length || 0} записей
+                </Typography>
               </Typography>
               {loading ? (
                 <Box sx={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: 300 }}>

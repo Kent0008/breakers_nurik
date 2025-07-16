@@ -10,6 +10,13 @@ class MonitoringConsumer(AsyncWebsocketConsumer):
     async def connect(self):
         """Обработчик подключения WebSocket"""
         await self.accept()
+        
+        # Подписываемся на группу инцидентов
+        await self.channel_layer.group_add(
+            'incidents',
+            self.channel_name
+        )
+        
         await self.send(text_data=json.dumps({
             'type': 'connection_established',
             'message': 'Подключен к системе мониторинга'

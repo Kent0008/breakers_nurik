@@ -5,6 +5,8 @@ from decimal import Decimal
 from django.conf import settings
 from django.utils import timezone
 import paho.mqtt.client as mqtt
+from channels.layers import get_channel_layer
+from asgiref.sync import async_to_sync
 from .models import SensorData, Threshold, Incident
 
 logger = logging.getLogger(__name__)
@@ -73,8 +75,13 @@ class MQTTClient:
                 timestamp=timestamp
             )
             
+            # Отправляем данные через WebSocket
+            self.send_sensor_update(sensor_data)
+            
             # Проверяем уставки
-            self.check_thresholds(sensor_data)
+            incident = self.check_thresholds(sensor_data)
+            if incident:
+                self.send_incident_alert(incident)
             
         except json.JSONDecodeError:
             logger.error(f"Ошибка парсинга JSON: {msg.payload}")
@@ -100,7 +107,7 @@ class MQTTClient:
         try:
             threshold = Threshold.objects.filter(tag=sensor_data.tag).first()
             if not threshold:
-                return
+                return None
             
             is_violated, violation_type = threshold.is_violated(sensor_data.value)
             
@@ -116,9 +123,52 @@ class MQTTClient:
                 )
                 
                 logger.warning(f"Создан инцидент: {incident}")
+                return incident
                 
         except Exception as e:
             logger.error(f"Ошибка проверки уставок: {e}")
+        
+        return None
+    
+    def send_sensor_update(self, sensor_data):
+        """Отправляет обновление сенсора через WebSocket"""
+        try:
+            channel_layer = get_channel_layer()
+            async_to_sync(channel_layer.group_send)(
+                f"sensor_{sensor_data.tag}",
+                {
+                    'type': 'sensor_update',
+                    'tag': sensor_data.tag,
+                    'data': {
+                        'timestamp': sensor_data.timestamp.isoformat(),
+                        'value': float(sensor_data.value),
+                        'tag': sensor_data.tag
+                    }
+                }
+            )
+            logger.info(f"Отправлено WebSocket обновление для {sensor_data.tag}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки WebSocket обновления: {e}")
+    
+    def send_incident_alert(self, incident):
+        """Отправляет уведомление об инциденте через WebSocket"""
+        try:
+            channel_layer = get_channel_layer()
+            async_to_sync(channel_layer.group_send)(
+                'incidents',
+                {
+                    'type': 'incident_alert',
+                    'incident': {
+                        'tag': incident.tag,
+                        'value': float(incident.value),
+                        'violation_type': incident.violation_type,
+                        'timestamp': incident.timestamp.isoformat()
+                    }
+                }
+            )
+            logger.info(f"Отправлено WebSocket уведомление об инциденте {incident.tag}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки WebSocket уведомления об инциденте: {e}")
     
     def connect(self):
         """Подключение к MQTT брокеру"""

@@ -39,13 +39,31 @@ class SensorDataViewSet(viewsets.ReadOnlyModelViewSet):
             
             queryset = queryset.filter(timestamp__gte=start_time)
         
-        return queryset.order_by('timestamp')
+        # Ограничиваем все запросы максимум 200 записями для производительности
+        latest_records = list(queryset.order_by('-timestamp')[:200])
+        latest_records.reverse()  # Разворачиваем для хронологического порядка
+        return SensorData.objects.filter(id__in=[r.id for r in latest_records]).order_by('timestamp')
 
     @action(detail=False, methods=['get'])
     def tags(self, request):
         """Получение списка всех тегов"""
-        tags = SensorData.objects.values_list('tag', flat=True).distinct()
-        return Response({'tags': list(tags)})
+        # Получаем только теги, которые имеют данные за последние 24 часа
+        from datetime import timedelta
+        from django.db.models import Count
+        
+        recent_time = timezone.now() - timedelta(hours=24)
+        
+        # Используем агрегацию для быстрого подсчета
+        recent_tags = SensorData.objects.filter(
+            timestamp__gte=recent_time
+        ).values('tag').annotate(
+            count=Count('id')
+        ).order_by('-count')[:20]
+        
+        # Извлекаем только названия тегов
+        top_tags = [item['tag'] for item in recent_tags]
+        
+        return Response({'tags': top_tags})
 
 
 class ThresholdViewSet(viewsets.ModelViewSet):
